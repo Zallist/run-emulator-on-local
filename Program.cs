@@ -6,34 +6,51 @@ using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Win32;
 using RoboSharp;
 using RoboSharp.Interfaces;
 
 namespace EmulatorStarter
 {
-    internal static class Program
+    public static class Config
     {
-        #region Configuration
-
-        private static string EmulatorRemotePath =
+        public static readonly string EmulatorRemotePath =
             Path.GetFullPath(
                 Environment.ExpandEnvironmentVariables(
                     System.Configuration.ConfigurationManager.AppSettings["EmulatorRemotePath"]));
 
-        private static string EmulatorLocalPath =
+        public static readonly string EmulatorLocalPath =
             Path.GetFullPath(
                 Environment.ExpandEnvironmentVariables(
                     System.Configuration.ConfigurationManager.AppSettings["EmulatorLocalPath"]));
 
-        private static string EmulatorDesktopExe = System.Configuration.ConfigurationManager.AppSettings["EmulatorDesktopExe"];
+        public static readonly string EmulatorDesktopExe = System.Configuration.ConfigurationManager.AppSettings["EmulatorDesktopExe"];
 
-        private static string EmulatorFullscreenExe = System.Configuration.ConfigurationManager.AppSettings["EmulatorFullscreenExe"];
+        public static readonly string EmulatorFullscreenExe = System.Configuration.ConfigurationManager.AppSettings["EmulatorFullscreenExe"];
 
-        private const string LIBRARY_FILES_RELATIVE_PATH = "library\\files";
+        public static readonly string[] CopyFoldersBackAfterRun = 
+            System.Configuration.ConfigurationManager.AppSettings["CopyFoldersBackAfterRun"].Split(',') ??
+                new string[0];
 
-        #endregion
+        public static readonly string[] EnsureProgramsRunningWithEmulator = 
+            System.Configuration.ConfigurationManager.AppSettings["EnsureProgramsRunningWithEmulator"]?.Split(',') ??
+                new string[0];
 
-        private const string APPLICATION_ID = "5378a98e-8d56-4f3d-aa3c-c069e056dcc1";
+        public static readonly bool DisableXboxGuideButton;
+
+        public const string LIBRARY_FILES_RELATIVE_PATH = "library\\files";
+
+        public const string APPLICATION_ID = "5378a98e-8d56-4f3d-aa3c-c069e056dcc1";
+
+        static Config()
+        {
+            if (!bool.TryParse(System.Configuration.ConfigurationManager.AppSettings["DisableXboxGuideButton"], out DisableXboxGuideButton))
+                DisableXboxGuideButton = false;
+        }
+    }
+
+    internal static class Program
+    {
 
         static async Task Main(string[] args)
         {
@@ -41,13 +58,13 @@ namespace EmulatorStarter
 
             Mutex mutex;
 
-            if (Mutex.TryOpenExisting(APPLICATION_ID, out _))
+            if (Mutex.TryOpenExisting(Config.APPLICATION_ID, out _))
             {
                 IsAlreadyRunning();
                 return;
             }
 
-            mutex = new Mutex(false, APPLICATION_ID, out var createdNew);
+            mutex = new Mutex(false, Config.APPLICATION_ID, out var createdNew);
 
             if (!createdNew)
             {
@@ -57,29 +74,33 @@ namespace EmulatorStarter
 
             var argsList = new List<string>(args);
 
-            var executable = EmulatorDesktopExe;
+            var executable = Config.EmulatorDesktopExe;
             if (argsList.Remove("fullscreen"))
-                executable = EmulatorFullscreenExe;
+                executable = Config.EmulatorFullscreenExe;
             if (argsList.Remove("desktop"))
-                executable = EmulatorDesktopExe;
+                executable = Config.EmulatorDesktopExe;
 
             var updateAllRemoteFiles = argsList.Remove("update-all-remote-files");
 
             using (mutex)
             {
-                EnsureInternetOptionsTrust();
-                await CopyFromSourceToTarget(EmulatorRemotePath, EmulatorLocalPath);
-                await EnsureLibraryFilesDirectoryJunction();
-
-                await StartEmulator(executable, argsList);
-
-                if (updateAllRemoteFiles)
+                using (var systemOptionApplier = new SystemOptionApplier())
                 {
-                    await CopyFromSourceToTarget(EmulatorLocalPath, EmulatorRemotePath);
-                }
-                else
-                {
-                    await CopySpecificsToRemote();
+                    await CopyFromSourceToTarget(Config.EmulatorRemotePath, Config.EmulatorLocalPath, CopyActionFlags.Purge);
+                    await EnsureLibraryFilesDirectoryJunction();
+
+                    EnsureProgramsRunningWithEmulator();
+
+                    await StartEmulator(executable, argsList);
+
+                    if (updateAllRemoteFiles)
+                    {
+                        await CopyFromSourceToTarget(Config.EmulatorLocalPath, Config.EmulatorRemotePath, CopyActionFlags.Purge);
+                    }
+                    else
+                    {
+                        await CopySpecificsToRemote();
+                    }
                 }
             }
         }
@@ -97,24 +118,24 @@ namespace EmulatorStarter
         {
             using (var cmd = new Process())
             {
-                cmd.StartInfo.FileName = Path.Combine(EmulatorLocalPath, exe);
+                cmd.StartInfo.FileName = Path.Combine(Config.EmulatorLocalPath, exe);
                 cmd.StartInfo.Arguments = string.Join(" ", args);
 
                 cmd.StartInfo.UseShellExecute = false;
 
-                cmd.StartInfo.WorkingDirectory = EmulatorLocalPath;
+                cmd.StartInfo.WorkingDirectory = Config.EmulatorLocalPath;
 
                 await StartAndWaitAsync(cmd);
             }
         }
 
-        private static async Task CopyFromSourceToTarget(string source, string target)
+        private static async Task CopyFromSourceToTarget(string source, string target, CopyActionFlags copyActionFlags = CopyActionFlags.Default)
         {
-            using (var robocmd = new RoboSharp.RoboCommand(source, target))
+            using (var robocmd = new RoboSharp.RoboCommand(source, target, copyActionFlags))
             {
                 ConfigureRoboCommand(robocmd);
 
-                robocmd.SelectionOptions.ExcludedDirectories.Add(Path.Combine(source, LIBRARY_FILES_RELATIVE_PATH));
+                robocmd.SelectionOptions.ExcludedDirectories.Add(Path.Combine(source, Config.LIBRARY_FILES_RELATIVE_PATH));
 
                 var task = robocmd.Start();
 
@@ -158,14 +179,17 @@ namespace EmulatorStarter
 
         private static async Task CopySpecificsToRemote()
         {
-            foreach (var copyAfter in System.Configuration.ConfigurationManager.AppSettings["CopyFoldersBackAfterRun"].Split(','))
+            foreach (var copyAfter in Config.CopyFoldersBackAfterRun)
             {
-                var source = Path.Combine(EmulatorLocalPath, copyAfter);
-                var target = Path.Combine(EmulatorRemotePath, copyAfter);
+                var source = Path.Combine(Config.EmulatorLocalPath, copyAfter);
+                var target = Path.Combine(Config.EmulatorRemotePath, copyAfter);
 
                 using (var robocmd = new RoboSharp.RoboCommand(source, target))
                 {
                     ConfigureRoboCommand(robocmd);
+
+                    robocmd.SelectionOptions.ExcludeOlder = true;
+
                     await robocmd.Start();
                 }
             }
@@ -182,18 +206,18 @@ namespace EmulatorStarter
             robocmd.RetryOptions.RetryCount = 3;
             robocmd.RetryOptions.RetryWaitTime = 1;
 
-            robocmd.SelectionOptions.ExcludeOlder = true;
+            //robocmd.SelectionOptions.ExcludeOlder = true;
             robocmd.SelectionOptions.ExcludeJunctionPoints = true;
         }
 
         private static async Task EnsureLibraryFilesDirectoryJunction()
         {
-            var libraryFilesDir = new DirectoryInfo(Path.Combine(EmulatorLocalPath, LIBRARY_FILES_RELATIVE_PATH));
+            var libraryFilesDir = new DirectoryInfo(Path.Combine(Config.EmulatorLocalPath, Config.LIBRARY_FILES_RELATIVE_PATH));
 
             if (!libraryFilesDir.Exists || !libraryFilesDir.Attributes.HasFlag(FileAttributes.ReparsePoint))
             {
                 if (libraryFilesDir.Exists)
-                    libraryFilesDir.MoveTo(Path.Combine(EmulatorLocalPath, LIBRARY_FILES_RELATIVE_PATH + ".bak"));
+                    libraryFilesDir.MoveTo(Path.Combine(Config.EmulatorLocalPath, Config.LIBRARY_FILES_RELATIVE_PATH + ".bak"));
 
                 // make junction
                 using (var cmd = new System.Diagnostics.Process())
@@ -202,9 +226,33 @@ namespace EmulatorStarter
                     cmd.StartInfo.UseShellExecute = true;
                     cmd.StartInfo.CreateNoWindow = true;
                     cmd.StartInfo.Verb = "runas";
-                    cmd.StartInfo.Arguments = $"/c mklink /D \"{Path.Combine(EmulatorLocalPath, LIBRARY_FILES_RELATIVE_PATH)}\" \"{Path.Combine(EmulatorRemotePath, LIBRARY_FILES_RELATIVE_PATH)}\"";
+                    cmd.StartInfo.Arguments = $"/c mklink /D " +
+                        $"\"{Path.Combine(Config.EmulatorLocalPath, Config.LIBRARY_FILES_RELATIVE_PATH)}\" " +
+                        $"\"{Path.Combine(Config.EmulatorRemotePath, Config.LIBRARY_FILES_RELATIVE_PATH)}\"";
 
                     await StartAndWaitAsync(cmd);
+                }
+            }
+        }
+
+        private static void EnsureProgramsRunningWithEmulator()
+        {
+            foreach (var ensureRunning in Config.EnsureProgramsRunningWithEmulator)
+            {
+                var exeName = Path.GetFileName(ensureRunning);
+
+                if (Process.GetProcessesByName(exeName).Length == 0)
+                {
+                    using (var cmd = new System.Diagnostics.Process())
+                    { 
+                        cmd.StartInfo.FileName = ensureRunning;
+                        cmd.StartInfo.WorkingDirectory = Path.GetDirectoryName(ensureRunning);
+                        cmd.StartInfo.UseShellExecute = true;
+
+                        cmd.Start();
+
+                        ChildProcessTracker.AddProcess(cmd);
+                    }
                 }
             }
         }
@@ -228,10 +276,76 @@ namespace EmulatorStarter
 
             return await tcs.Task;
         }
+    }
 
-        private static void EnsureInternetOptionsTrust()
+    internal class SystemOptionApplier : IDisposable
+    {
+        private readonly List<Tuple<RegistryKey, string, object, RegistryValueKind>> currentUserRegistryKeysToRevertTo = new List<Tuple<RegistryKey, string, object, RegistryValueKind>>();
+
+        public SystemOptionApplier()
         {
-            var remoteUNCPath = MappedDriveResolver.ResolveToRootUNC(EmulatorRemotePath);
+            EnsureInternetOptionsTrust();
+
+            if (Config.DisableXboxGuideButton)
+            {
+                DisableXboxGuideButton();
+            }
+        }
+
+        public void Dispose()
+        {
+            foreach (var tuple in currentUserRegistryKeysToRevertTo)
+            {
+                var subkey = tuple.Item1;
+                var valueName = tuple.Item2;
+                var valueData = tuple.Item3;
+                var valueKind = tuple.Item4;
+
+                if (valueData == null)
+                {
+                    subkey.DeleteValue(valueName, false);
+                }
+                else
+                {
+                    subkey.SetValue(valueName, valueData, valueKind);
+                }
+            }
+
+            foreach (var key in currentUserRegistryKeysToRevertTo.Select(x => x.Item1).Distinct())
+                key.Dispose();
+
+            currentUserRegistryKeysToRevertTo.Clear();
+        }
+
+        private void DisableXboxGuideButton()
+        {
+            var key = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\GameBar", true);
+
+            if (key != null)
+            {
+                currentUserRegistryKeysToRevertTo.Add(Tuple.Create(
+                    key,
+                    "UseNexusForGameBarEnabled", 
+                    key.GetValue("UseNexusForGameBarEnabled", null), 
+                    key.GetValue("UseNexusForGameBarEnabled", null) != null ? key.GetValueKind("UseNexusForGameBarEnabled") : RegistryValueKind.None));
+
+                key.SetValue("UseNexusForGameBarEnabled", 0, RegistryValueKind.DWord);
+            }
+
+            try
+            {
+                foreach (var gameBarProcess in Process.GetProcessesByName("GameBar.exe"))
+                    gameBarProcess.Kill();
+            }
+            catch (Exception)
+            {
+
+            }
+        }
+
+        private void EnsureInternetOptionsTrust()
+        {
+            var remoteUNCPath = MappedDriveResolver.ResolveToRootUNC(Config.EmulatorRemotePath);
 
             if (!remoteUNCPath.StartsWith(@"\\"))
                 return;
